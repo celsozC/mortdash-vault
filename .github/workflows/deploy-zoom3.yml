@@ -1,0 +1,246 @@
+name: ZoomS3 Development Deployment
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: zoom3-454015
+  SERVICE_NAME: zooms3-develop
+  ARTIFACT_REGISTRY: us-west1-docker.pkg.dev/zoom3-454015/zooms3-develop
+  REGION: us-west1
+  SECRET_NAME: zooms3-develop
+  SERVICE_ACCOUNT: 734979083625-compute@developer.gserviceaccount.com
+    
+jobs:
+  deploy:
+    name: ZoomS3 Development Deployment
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_ZOOM3 }}
+
+      - name: Fetch environment variables from Secret Manager
+        id: secrets
+        run: |
+          echo "Fetching environment variables from Secret Manager"
+          
+          # Fetch the .env content directly from the secret
+          gcloud secrets versions access latest --secret="${{ env.SECRET_NAME }}" --project="${{ env.PROJECT_ID }}" > .env
+          
+          # Verify the .env file format
+          echo "Verifying .env file format..."
+          if [ -s .env ]; then
+            echo "Environment file created successfully"
+            # Print first few lines without values for verification (safe to log)
+            head -n 5 .env | sed 's/=.*/=****/' || true
+          else
+            echo "Error: .env file is empty"
+            exit 1
+          fi
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
+
+      - name: Generate timestamp for unique version
+        id: timestamp
+        run: echo "timestamp=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        run: |
+          docker build \
+            -t ${{ env.ARTIFACT_REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.timestamp.outputs.timestamp }} .
+          docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.timestamp.outputs.timestamp }}
+
+      - name: Get current traffic allocation
+        id: get-traffic
+        run: |
+          # Check if the service exists and get current revision info
+          if gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.REGION }} 2>/dev/null; then
+            # Get the current active revision
+            CURRENT_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.REGION }} --format="value(status.traffic.revisionName)" | head -n 1)
+            echo "Current active revision: $CURRENT_REVISION"
+            
+            # Determine the next tag based on current revision
+            if [[ $CURRENT_REVISION == *"-blue-"* ]]; then
+              echo "current=blue" >> $GITHUB_OUTPUT
+              echo "next=green" >> $GITHUB_OUTPUT
+            else
+              echo "current=green" >> $GITHUB_OUTPUT
+              echo "next=blue" >> $GITHUB_OUTPUT
+            fi
+          else
+            # Service doesn't exist yet, start with blue
+            echo "current=none" >> $GITHUB_OUTPUT
+            echo "next=blue" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy new revision
+        id: deploy
+        run: |
+          # Ensure .env ends with a newline to process the last line
+          sed -i -e '$a\' .env
+
+          # Create env vars string for deployment
+          ENV_VARS=""
+          while IFS='=' read -r key value; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" == \#* ]] && continue
+
+            # Remove surrounding quotes
+            value=$(echo "$value" | sed -e "s/^[\"']//;s/[\"']$//")
+
+            # If the key is a private key, replace \n with actual newlines
+            if [[ "$key" == *PRIVATE_KEY* ]]; then
+              value=$(echo "$value" | sed 's/\\n/\n/g')
+            fi
+
+            # Log the key name but mask the value for security
+            echo "Processing environment variable: $key=********"
+
+            # Properly escape the value for Cloud Run
+            escaped_value=$(printf '%s' "$value" | sed 's/"/\\"/g')
+            ENV_VARS="$ENV_VARS --set-env-vars=$key=\"$escaped_value\""
+          done < .env
+
+          # Check if service exists
+          if gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.REGION }} 2>/dev/null; then
+            # Service exists - deploy new revision with no traffic
+            echo "Updating existing service..."
+            echo "Using environment variables (keys only):"
+            echo "$ENV_VARS" | sed 's/=.*/=********/g'
+            eval gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image ${{ env.ARTIFACT_REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.timestamp.outputs.timestamp }} \
+              --region ${{ env.REGION }} \
+              --platform managed \
+              --allow-unauthenticated \
+              --service-account ${{ env.SERVICE_ACCOUNT }} \
+              --min-instances 2 \
+              --max-instances 10 \
+              --memory 1Gi \
+              --cpu 1 \
+              --timeout 300 \
+              --port 8080 \
+              --concurrency 80 \
+              --no-cpu-throttling \
+              --execution-environment gen2 \
+              --cpu-boost \
+              --set-env-vars NGINX_WORKER_PROCESSES=4 \
+              --tag ${{ steps.get-traffic.outputs.next }} \
+              --no-traffic \
+              $ENV_VARS
+          else
+            # Service doesn't exist - create new service
+            echo "Creating new service..."
+            echo "Using environment variables (keys only):"
+            echo "$ENV_VARS" | sed 's/=.*/=********/g'
+            eval gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image ${{ env.ARTIFACT_REGISTRY }}/${{ env.SERVICE_NAME }}:${{ steps.timestamp.outputs.timestamp }} \
+              --region ${{ env.REGION }} \
+              --platform managed \
+              --allow-unauthenticated \
+              --service-account ${{ env.SERVICE_ACCOUNT }} \
+              --min-instances 1 \
+              --max-instances 10 \
+              --memory 1Gi \
+              --cpu 1 \
+              --timeout 300 \
+              --port 8080 \
+              --concurrency 80 \
+              --no-cpu-throttling \
+              --execution-environment gen2 \
+              --cpu-boost \
+              --set-env-vars NGINX_WORKER_PROCESSES=4 \
+              --tag ${{ steps.get-traffic.outputs.next }} \
+              $ENV_VARS
+          fi
+
+      - name: Test new deployment
+        id: test-deployment
+        run: |
+          # Get the URL with the tag parameter
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.REGION }} --format="value(status.url)")
+          TAG_URL="${SERVICE_URL}/health?tag=${{ steps.get-traffic.outputs.next }}"
+          
+          echo "Testing health check URL: $TAG_URL"
+          
+          # Add a small delay to allow the service to initialize
+          echo "Waiting 10 seconds for service to initialize..."
+          sleep 10
+          
+          # Test the health check endpoint with retries
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          SUCCESS=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES"
+            RESPONSE=$(curl -s -v "$TAG_URL" 2>&1)
+            HTTP_STATUS=$(echo "$RESPONSE" | grep "< HTTP" | awk '{print $3}')
+            
+            echo "Full response:"
+            echo "$RESPONSE"
+            echo "HTTP Status: $HTTP_STATUS"
+            
+            if [[ "$HTTP_STATUS" =~ ^(200|201|202|204)$ ]]; then
+              echo "Health check successful (Status: $HTTP_STATUS)"
+              SUCCESS=true
+              break
+            else
+              echo "Health check failed with status $HTTP_STATUS"
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "Retrying in 10 seconds..."
+                sleep 10
+              fi
+            fi
+          done
+          
+          if [ "$SUCCESS" = true ]; then
+            echo "test_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "All health check attempts failed"
+            echo "test_success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Migrate traffic to new revision
+        if: steps.test-deployment.outputs.test_success == 'true'
+        run: |
+          echo "Migrating traffic to new revision with tag ${{ steps.get-traffic.outputs.next }}"
+          gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --to-tags ${{ steps.get-traffic.outputs.next }}=100
+          
+          # Verify traffic migration
+          echo "Verifying traffic migration..."
+          TRAFFIC_INFO=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.REGION }} --format="value(status.traffic)")
+          echo "Current traffic distribution:"
+          echo "$TRAFFIC_INFO"
+
+      - name: Rollback if test failed
+        if: steps.test-deployment.outputs.test_success == 'false'
+        run: |
+          echo "Test failed, keeping traffic on current revision"
+          # We don't need to do anything as the new revision has no traffic
